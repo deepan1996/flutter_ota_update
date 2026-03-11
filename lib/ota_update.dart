@@ -17,13 +17,15 @@ class OtaUpdate {
     return _methodChannel.invokeMethod<String>('getAbi');
   }
 
-  /// Cancel the currently active ota download if there is one
+  /// Cancel the currently active ota download if there is one.
+  /// Resets internal stream so [execute] can start a fresh download afterwards.
   Future<void> cancel() async {
+    _progressStream = null;
     return _methodChannel.invokeMethod<void>('cancel');
   }
 
-  /// Execute download and instalation of the plugin.
-  /// Download progress and all success or error states are publish in stream as OtaEvent
+  /// Execute download and installation of the plugin.
+  /// Download progress and all success or error states are published in stream as [OtaEvent].
   Stream<OtaEvent> execute(
     String url, {
     Map<String, String> headers = const <String, String>{},
@@ -51,6 +53,7 @@ class OtaUpdate {
             controller.add(otaEvent);
           })
         ..onDone(() {
+          _progressStream = null;
           controller.close();
         })
         ..onError((Object error) {

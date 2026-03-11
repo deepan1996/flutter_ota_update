@@ -88,6 +88,7 @@ public class OtaUpdatePlugin implements
 
     //DOWNLOAD SPECIFIC PLUGIN STATE. PLUGIN SUPPORT ONLY ONE DOWNLOAD AT A TIME
     private Call currentCall;
+    private volatile boolean cancelled = false;
     private String downloadUrl;
     private JSONObject headers;
     private String filename;
@@ -138,11 +139,13 @@ public class OtaUpdatePlugin implements
         if (call.method.equals("getAbi")) {
             result.success(Build.SUPPORTED_ABIS[0]);
         } else if (call.method.equals("cancel")) {
+            cancelled = true;
             if (currentCall != null) {
                 currentCall.cancel();
                 currentCall = null;
-                reportStatus(true, OtaStatus.CANCELED, "Call was canceled using cancel()", null, null);
             }
+            deleteDownloadedApk();
+            reportStatus(true, OtaStatus.CANCELED, "Call was canceled using cancel()", null, null);
             result.success(null);
         } else {
             result.notImplemented();
@@ -235,12 +238,12 @@ public class OtaUpdatePlugin implements
                 return;
             }
 
+            cancelled = false;
+
             String dataDir = context.getApplicationInfo().dataDir + "/files/ota_update";
-            //PREPARE URLS
             final String destination = dataDir + "/" + filename;
             final Uri fileUri = Uri.parse("file://" + destination);
 
-            //DELETE APK FILE IF IT ALREADY EXISTS
             final File file = new File(destination);
             if (file.exists()) {
                 if (!file.delete()) {
@@ -268,14 +271,24 @@ public class OtaUpdatePlugin implements
             currentCall.enqueue(new Callback() {
                 @Override
                 public void onFailure(@NotNull Call call, @NotNull IOException e) {
+                    if (cancelled) {
+                        currentCall = null;
+                        return;
+                    }
                     reportStatus(true, OtaStatus.DOWNLOAD_ERROR, e.getMessage(), e, null);
                     currentCall = null;
                 }
 
                 @Override
                 public void onResponse(@NotNull Call call, @NotNull Response response) {
+                    if (cancelled) {
+                        currentCall = null;
+                        return;
+                    }
                     if (!response.isSuccessful()) {
                         reportStatus(true, OtaStatus.DOWNLOAD_ERROR, "Http request finished with status " + response.code(), null, null);
+                        currentCall = null;
+                        return;
                     }
                     try {
                         BufferedSink sink = Okio.buffer(Okio.sink(file));
@@ -284,11 +297,17 @@ public class OtaUpdatePlugin implements
                         }
                         sink.close();
                     } catch (StreamResetException ex) {
-                        // Thrown when the call was canceled using 'cancel()'
                         currentCall = null;
                         return;
                     } catch (IOException | RuntimeException ex) {
-                        reportStatus(true, OtaStatus.DOWNLOAD_ERROR, ex.getMessage(), ex, null);
+                        if (!cancelled) {
+                            reportStatus(true, OtaStatus.DOWNLOAD_ERROR, ex.getMessage(), ex, null);
+                        }
+                        currentCall = null;
+                        return;
+                    }
+                    if (cancelled) {
+                        file.delete();
                         currentCall = null;
                         return;
                     }
@@ -313,29 +332,27 @@ public class OtaUpdatePlugin implements
      * @param fileUri     Uri to file
      */
     private void onDownloadComplete(final String destination, final Uri fileUri) {
-        //DOWNLOAD IS COMPLETE, UNREGISTER RECEIVER AND CLOSE PROGRESS SINK
+        if (cancelled) {
+            new File(destination).delete();
+            return;
+        }
         final File downloadedFile = new File(destination);
         if (!downloadedFile.exists()) {
             reportStatus(true, OtaStatus.DOWNLOAD_ERROR, "File was not downloaded", null, null);
             return;
         }
         if (checksum != null) {
-            //IF the user provided checksum verify file integrity
             try {
                 if (!Sha256ChecksumValidator.validateChecksum(checksum, downloadedFile)) {
-                    //SEND CHECKSUM ERROR EVENT
                     reportStatus(true, OtaStatus.CHECKSUM_ERROR, "Checksum verification failed", null, null);
                     return;
                 }
             } catch (RuntimeException ex) {
-                //SEND CHECKSUM ERROR EVENT
                 reportStatus(true, OtaStatus.CHECKSUM_ERROR, ex.getMessage(), ex, null);
                 return;
             }
         }
-        //TRIGGER APK INSTALLATION
-        handler.post(() -> executeInstallation(fileUri, downloadedFile)
-        );
+        handler.post(() -> executeInstallation(fileUri, downloadedFile));
     }
 
     /**
@@ -364,7 +381,11 @@ public class OtaUpdatePlugin implements
      * @param downloadedFile Downloaded file
      */
     private void executeInstallation(Uri fileUri, File downloadedFile) {
-        // Try silent installation for system apps first
+        if (cancelled) {
+            Log.d(TAG, "Installation skipped — cancelled");
+            downloadedFile.delete();
+            return;
+        }
         if (hasInstallPackagesPermission()) {
             Log.d(TAG, "App has INSTALL_PACKAGES, using package installer");
             installUsingPackageInstaller(downloadedFile);
@@ -575,6 +596,7 @@ public class OtaUpdatePlugin implements
 
     @Override
     public void onDownloadProgress(long bytesRead, long contentLength, boolean done) {
+        if (cancelled) return;
         if (done) {
             Log.d(TAG, "Download is complete");
         } else {
@@ -593,10 +615,19 @@ public class OtaUpdatePlugin implements
             }
         }
     }
-    /**
-     * Single place that disposes the stream: endOfStream() and null the sink.
-     * Only call when the stream is truly done (result sent, or cancel/error path).
-     */
+    private void deleteDownloadedApk() {
+        try {
+            String dataDir = context.getApplicationInfo().dataDir + "/files/ota_update";
+            String destination = dataDir + "/" + (filename != null ? filename : DEFAULT_APK_NAME);
+            File file = new File(destination);
+            if (file.exists()) {
+                file.delete();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to delete APK on cancel", e);
+        }
+    }
+
     private void closeSink() {
         if (progressSink != null) {
             progressSink.endOfStream();
